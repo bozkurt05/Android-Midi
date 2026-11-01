@@ -1,0 +1,692 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.example.orientalorg'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.example.orientalorg"
+        minSdk 23
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+        ndk { abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64' }
+        externalNativeBuild {
+            cmake {
+                cppFlags '-std=c++17 -O3'
+                arguments '-DANDROID_STL=c++_shared'
+            }
+        }
+    }
+    buildFeatures { prefab true }
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.oboe:oboe:1.9.0'
+}
+cmake_minimum_required(VERSION 3.22.1)
+project("orgengine")
+
+find_package(oboe REQUIRED CONFIG)
+
+add_library(orgengine SHARED NativeAudioEngine.cpp)
+target_link_libraries(orgengine oboe::oboe log android)
+#include <jni.h>
+#include <oboe/Oboe.h>
+#include <atomic>
+#include <array>
+#include <cmath>
+#include <cstring>
+#include <memory>
+#include <mutex>
+
+namespace {
+constexpr int kMaxVoices = 16;
+constexpr float kTwoPi = 6.283185307179586f;
+
+struct Voice {
+    std::atomic<bool> gate{false};
+    std::atomic<int> note{-1};
+    std::atomic<float> velocity{0.f};
+    std::atomic<uint32_t> trigger{0};
+    std::atomic<float> level{0.f};
+    // sadece ses thread'i
+    uint32_t seenTrigger = 0;
+    int curNote = -1;
+    float curVel = 0.f;
+    float phase = 0.f;
+    float env = 0.f;
+};
+
+class Engine : public oboe::AudioStreamCallback {
+public:
+    Engine() { for (auto &k : koma) k.store(0.f); }
+
+    bool start() { wanted = true; return open(); }
+
+    void stop() {
+        wanted = false;
+        std::lock_guard<std::mutex> lk(mtx);
+        if (stream) {
+            stream->stop();
+            stream->close();
+            stream.reset();
+        }
+    }
+
+    void noteOn(int note, float vel) {
+        if (vel < 0.f) vel = 0.f;
+        if (vel > 1.f) vel = 1.f;
+        int idx = -1;
+        for (int i = 0; i < kMaxVoices; i++)
+            if (voices[i].note.load() == note && active(voices[i])) { idx = i; break; }
+        if (idx < 0)
+            for (int i = 0; i < kMaxVoices; i++)
+                if (!active(voices[i])) { idx = i; break; }
+        if (idx < 0) idx = (int)(rr.fetch_add(1) % kMaxVoices);
+        Voice &v = voices[idx];
+        v.note.store(note);
+        v.velocity.store(vel);
+        v.gate.store(true);
+        v.trigger.fetch_add(1, std::memory_order_release);
+    }
+
+    void noteOff(int note) {
+        for (auto &v : voices)
+            if (v.note.load() == note && v.gate.load()) v.gate.store(false);
+    }
+
+    void allNotesOff() { for (auto &v : voices) v.gate.store(false); }
+
+    void setKoma(int pc, float cents) { if (pc >= 0 && pc < 12) koma[pc].store(cents); }
+    void setMaster(float m) { master.store(m < 0.f ? 0.f : (m > 1.f ? 1.f : m)); }
+
+    oboe::DataCallbackResult onAudioReady(oboe::AudioStream *, void *audioData,
+                                          int32_t numFrames) override {
+        float *out = static_cast<float *>(audioData);
+        const int ch = channels;
+        const float sr = sampleRate;
+        std::memset(out, 0, sizeof(float) * numFrames * ch);
+
+        const float atk = 1.f / (0.005f * sr);
+        const float rel = std::exp(-1.f / (0.08f * sr));
+
+        for (auto &v : voices) {
+            uint32_t t = v.trigger.load(std::memory_order_acquire);
+            if (t != v.seenTrigger) {
+                v.seenTrigger = t;
+                v.curNote = v.note.load();
+                v.curVel = v.velocity.load();
+            }
+            const bool gate = v.gate.load();
+            if (v.curNote < 0 || (!gate && v.env <= 0.0005f)) {
+                v.env = 0.f;
+                v.level.store(0.f, std::memory_order_relaxed);
+                continue;
+            }
+            const int pc = ((v.curNote % 12) + 12) % 12;
+            const float cents = koma[pc].load();
+            const float freq = 440.f * std::exp2((v.curNote - 69) / 12.f + cents / 1200.f);
+            const float inc = freq / sr;
+            const float amp = v.curVel * 0.2f;
+            float ph = v.phase, env = v.env;
+
+            for (int f = 0; f < numFrames; f++) {
+                if (gate) { env += atk; if (env > 1.f) env = 1.f; }
+                else env *= rel;
+                const float a = kTwoPi * ph;
+                const float s = std::sin(a) + 0.5f * std::sin(2.f * a) + 0.25f * std::sin(3.f * a);
+                out[f * ch] += s * env * amp;
+                ph += inc;
+                if (ph >= 1.f) ph -= 1.f;
+            }
+            v.phase = ph;
+            v.env = env;
+            v.level.store(env, std::memory_order_relaxed);
+        }
+
+        const float target = master.load();
+        for (int f = 0; f < numFrames; f++) {
+            masterSmooth += (target - masterSmooth) * 0.002f;
+            const float y = std::tanh(out[f * ch] * masterSmooth);
+            for (int c = 0; c < ch; c++) out[f * ch + c] = y;
+        }
+        return oboe::DataCallbackResult::Continue;
+    }
+
+    void onErrorAfterClose(oboe::AudioStream *, oboe::Result result) override {
+        if (result == oboe::Result::ErrorDisconnected && wanted.load()) {
+            { std::lock_guard<std::mutex> lk(mtx); stream.reset(); }
+            open();
+        }
+    }
+
+private:
+    static bool active(const Voice &v) {
+        return v.gate.load() || v.level.load(std::memory_order_relaxed) > 0.001f;
+    }
+
+    bool open() {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (stream) return true;
+        oboe::AudioStreamBuilder b;
+        b.setDirection(oboe::Direction::Output)
+            ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
+            ->setSharingMode(oboe::SharingMode::Exclusive)
+            ->setFormat(oboe::AudioFormat::Float)
+            ->setChannelCount(oboe::ChannelCount::Stereo)
+            ->setUsage(oboe::Usage::Media)
+            ->setContentType(oboe::ContentType::Music)
+            ->setFormatConversionAllowed(true)
+            ->setChannelConversionAllowed(true)
+            ->setCallback(this);
+        if (b.openStream(stream) != oboe::Result::OK) { stream.reset(); return false; }
+        stream->setBufferSizeInFrames(stream->getFramesPerBurst() * 2);
+        sampleRate = (float)stream->getSampleRate();
+        channels = stream->getChannelCount();
+        if (stream->requestStart() != oboe::Result::OK) {
+            stream->close();
+            stream.reset();
+            return false;
+        }
+        return true;
+    }
+
+    std::shared_ptr<oboe::AudioStream> stream;
+    std::mutex mtx;
+    std::atomic<bool> wanted{false};
+    int32_t channels = 2;
+    float sampleRate = 48000.f;
+    std::atomic<float> master{0.7f};
+    float masterSmooth = 0.7f;
+    std::atomic<float> koma[12];
+    std::array<Voice, kMaxVoices> voices;
+    std::atomic<uint32_t> rr{0};
+};
+
+Engine &engine() { static Engine e; return e; }
+}  // namespace
+
+extern "C" {
+JNIEXPORT jboolean JNICALL
+Java_com_example_orientalorg_NativeAudio_nativeStart(JNIEnv *, jobject) { return engine().start(); }
+
+JNIEXPORT void JNICALL
+Java_com_example_orientalorg_NativeAudio_nativeStop(JNIEnv *, jobject) { engine().stop(); }
+
+JNIEXPORT void JNICALL
+Java_com_example_orientalorg_NativeAudio_nativeNoteOn(JNIEnv *, jobject, jint note, jfloat vel) {
+    engine().noteOn(note, vel);
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_orientalorg_NativeAudio_nativeNoteOff(JNIEnv *, jobject, jint note) {
+    engine().noteOff(note);
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_orientalorg_NativeAudio_nativeAllNotesOff(JNIEnv *, jobject) { engine().allNotesOff(); }
+
+JNIEXPORT void JNICALL
+Java_com_example_orientalorg_NativeAudio_nativeSetKomaCents(JNIEnv *, jobject, jint pc, jfloat cents) {
+    engine().setKoma(pc, cents);
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_orientalorg_NativeAudio_nativeSetMasterVolume(JNIEnv *, jobject, jfloat v) {
+    engine().setMaster(v);
+}
+}
+package com.example.orientalorg
+
+object NativeAudio {
+    init { System.loadLibrary("orgengine") }
+
+    external fun nativeStart(): Boolean
+    external fun nativeStop()
+    external fun nativeNoteOn(note: Int, velocity: Float)
+    external fun nativeNoteOff(note: Int)
+    external fun nativeAllNotesOff()
+    external fun nativeSetKomaCents(pitchClass: Int, cents: Float)
+    external fun nativeSetMasterVolume(volume: Float)
+}
+package com.example.orientalorg
+
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.bluetooth.le.BluetoothLeScanner
+import android.content.Context
+import android.media.midi.MidiDevice
+import android.media.midi.MidiDeviceInfo
+import android.media.midi.MidiManager
+import android.media.midi.MidiOutputPort
+import android.media.midi.MidiReceiver
+import android.os.Handler
+import android.os.Looper
+import android.os.ParcelUuid
+import android.view.KeyEvent
+
+@SuppressLint("MissingPermission")
+class OrgMidiManager(
+    private val context: Context,
+    private val onStatus: (String) -> Unit
+) {
+    private class OpenDev(val device: MidiDevice, val ports: List<MidiOutputPort>, val name: String)
+
+    private val main = Handler(Looper.getMainLooper())
+    private val midi = context.getSystemService(Context.MIDI_SERVICE) as MidiManager
+    private val open = HashMap<Int, OpenDev>()
+    private var scanner: BluetoothLeScanner? = null
+    private var scanCb: ScanCallback? = null
+
+    var baseNote = 48 // C3
+
+    private val deviceCallback = object : MidiManager.DeviceCallback() {
+        override fun onDeviceAdded(info: MidiDeviceInfo) = openDevice(info)
+        override fun onDeviceRemoved(info: MidiDeviceInfo) = closeDevice(info.id)
+    }
+
+    // ---------- Yaşam döngüsü ----------
+    fun start() {
+        midi.registerDeviceCallback(deviceCallback, main)
+        @Suppress("DEPRECATION")
+        midi.devices.forEach { openDevice(it) }
+        updateStatus()
+    }
+
+    fun stop() {
+        stopScan()
+        runCatching { midi.unregisterDeviceCallback(deviceCallback) }
+        open.keys.toList().forEach { closeDevice(it) }
+        NativeAudio.nativeAllNotesOff()
+    }
+
+    // ---------- USB / Bluetooth MIDI ----------
+    private fun openDevice(info: MidiDeviceInfo) {
+        if (info.outputPortCount == 0 || open.containsKey(info.id)) return
+        midi.openDevice(info, MidiManager.OnDeviceOpenedListener { dev ->
+            if (dev != null) attach(dev)
+        }, main)
+    }
+
+    private fun attach(dev: MidiDevice) {
+        val info = dev.info
+        if (open.containsKey(info.id) || info.outputPortCount == 0) { dev.close(); return }
+        val ports = (0 until info.outputPortCount).mapNotNull { i ->
+            dev.openOutputPort(i)?.also { it.connect(PortReceiver()) }
+        }
+        val name = info.properties.getString(MidiDeviceInfo.PROPERTY_NAME)
+            ?: info.properties.getString(MidiDeviceInfo.PROPERTY_PRODUCT)
+            ?: "MIDI #${info.id}"
+        open[info.id] = OpenDev(dev, ports, name)
+        updateStatus()
+    }
+
+    private fun closeDevice(id: Int) {
+        val d = open.remove(id) ?: return
+        d.ports.forEach { runCatching { it.close() } }
+        runCatching { d.device.close() }
+        NativeAudio.nativeAllNotesOff()
+        updateStatus()
+    }
+
+    fun connectBluetooth(dev: BluetoothDevice) {
+        onStatus("Bluetooth bağlanıyor…")
+        midi.openBluetoothDevice(dev, MidiManager.OnDeviceOpenedListener { d ->
+            if (d != null) attach(d) else onStatus("Bluetooth MIDI bağlantısı başarısız")
+        }, main)
+    }
+
+    fun scanBluetooth(durationMs: Long = 6000, onDone: (List<BluetoothDevice>) -> Unit) {
+        val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        val sc = bm.adapter?.takeIf { it.isEnabled }?.bluetoothLeScanner
+        if (sc == null) { onStatus("Bluetooth kapalı veya yok"); onDone(emptyList()); return }
+        stopScan()
+        val found = LinkedHashMap<String, BluetoothDevice>()
+        val cb = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                found[result.device.address] = result.device
+            }
+        }
+        val filter = ScanFilter.Builder()
+            .setServiceUuid(ParcelUuid.fromString("03B80E5A-EDE8-4B33-A751-6CE34EC4C700"))
+            .build()
+        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+        scanner = sc
+        scanCb = cb
+        sc.startScan(listOf(filter), settings, cb)
+        main.postDelayed({ stopScan(); onDone(found.values.toList()) }, durationMs)
+    }
+
+    private fun stopScan() {
+        val cb = scanCb ?: return
+        runCatching { scanner?.stopScan(cb) }
+        scanCb = null
+    }
+
+    private fun updateStatus() {
+        onStatus(
+            if (open.isEmpty()) "MIDI: cihaz bağlı değil (PC klavye tuşları aktif)"
+            else "MIDI: ${open.size} cihaz bağlı → " + open.values.joinToString { it.name }
+        )
+    }
+
+    // ---------- MIDI ayrıştırıcı ----------
+    private inner class PortReceiver : MidiReceiver() {
+        override fun onSend(msg: ByteArray, offset: Int, count: Int, timestamp: Long) {
+            var i = offset
+            val end = offset + count
+            while (i < end) {
+                val st = msg[i].toInt() and 0xFF
+                when {
+                    st < 0x80 || st >= 0xF8 -> i++
+                    st == 0xF0 -> {
+                        while (i < end && (msg[i].toInt() and 0xFF) != 0xF7) i++
+                        i++
+                    }
+                    st >= 0xF0 -> i += when (st) { 0xF1, 0xF3 -> 2; 0xF2 -> 3; else -> 1 }
+                    else -> {
+                        val type = st and 0xF0
+                        val len = if (type == 0xC0 || type == 0xD0) 2 else 3
+                        if (i + len > end) return
+                        val d1 = msg[i + 1].toInt() and 0x7F
+                        val d2 = if (len == 3) msg[i + 2].toInt() and 0x7F else 0
+                        handle(type, d1, d2)
+                        i += len
+                    }
+                }
+            }
+        }
+    }
+
+    private fun handle(type: Int, d1: Int, d2: Int) {
+        when (type) {
+            0x90 -> if (d2 > 0) NativeAudio.nativeNoteOn(d1, d2 / 127f) else NativeAudio.nativeNoteOff(d1)
+            0x80 -> NativeAudio.nativeNoteOff(d1)
+            0xB0 -> if (d1 == 123 || d1 == 120) NativeAudio.nativeAllNotesOff()
+        }
+    }
+
+    // ---------- PC klavye (Prodikeys QWERTY bölümü dahil) ----------
+    private val keyMap = mapOf(
+        KeyEvent.KEYCODE_Z to 0, KeyEvent.KEYCODE_S to 1, KeyEvent.KEYCODE_X to 2,
+        KeyEvent.KEYCODE_D to 3, KeyEvent.KEYCODE_C to 4, KeyEvent.KEYCODE_V to 5,
+        KeyEvent.KEYCODE_G to 6, KeyEvent.KEYCODE_B to 7, KeyEvent.KEYCODE_H to 8,
+        KeyEvent.KEYCODE_N to 9, KeyEvent.KEYCODE_J to 10, KeyEvent.KEYCODE_M to 11,
+        KeyEvent.KEYCODE_Q to 12, KeyEvent.KEYCODE_2 to 13, KeyEvent.KEYCODE_W to 14,
+        KeyEvent.KEYCODE_3 to 15, KeyEvent.KEYCODE_E to 16, KeyEvent.KEYCODE_R to 17,
+        KeyEvent.KEYCODE_5 to 18, KeyEvent.KEYCODE_T to 19, KeyEvent.KEYCODE_6 to 20,
+        KeyEvent.KEYCODE_Y to 21, KeyEvent.KEYCODE_7 to 22, KeyEvent.KEYCODE_U to 23,
+        KeyEvent.KEYCODE_I to 24, KeyEvent.KEYCODE_9 to 25, KeyEvent.KEYCODE_O to 26,
+        KeyEvent.KEYCODE_0 to 27, KeyEvent.KEYCODE_P to 28
+    )
+
+    /** Activity.dispatchKeyEvent içinden çağır. Tuş işlendiyse true döner. */
+    fun handleKeyEvent(e: KeyEvent): Boolean {
+        val off = keyMap[e.keyCode] ?: return false
+        val note = baseNote + off
+        when (e.action) {
+            KeyEvent.ACTION_DOWN -> if (e.repeatCount == 0) NativeAudio.nativeNoteOn(note, 0.8f)
+            KeyEvent.ACTION_UP -> NativeAudio.nativeNoteOff(note)
+        }
+        return true
+    }
+}
+package com.example.orientalorg
+
+class KomaManager(private val centsDown: Float = 50f) {
+    val noteNames = arrayOf("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+    private val active = BooleanArray(12)
+
+    fun isActive(pitchClass: Int) = active[pitchClass]
+
+    /** Seçilen notanın tüm oktavlarını 50 cent aşağı çeker (kapalıyken 0). */
+    fun set(pitchClass: Int, enabled: Boolean) {
+        active[pitchClass] = enabled
+        NativeAudio.nativeSetKomaCents(pitchClass, if (enabled) -centsDown else 0f)
+    }
+
+    fun toggle(pitchClass: Int): Boolean {
+        set(pitchClass, !active[pitchClass])
+        return active[pitchClass]
+    }
+
+    fun resetAll() { for (i in 0 until 12) set(i, false) }
+}
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#1B1410"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Oryantal Org"
+            android:textColor="#F2C14E"
+            android:textSize="26sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tvMidiStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="MIDI: başlatılıyor…"
+            android:textColor="#DDDDDD"
+            android:textSize="14sp" />
+
+        <Button
+            android:id="@+id/btnBluetooth"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Bluetooth MIDI Cihazı Tara" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="Master Ses"
+            android:textColor="#F2C14E"
+            android:textSize="16sp" />
+
+        <SeekBar
+            android:id="@+id/sbMaster"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="100"
+            android:progress="70" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="Koma (nota başına −50 cent)"
+            android:textColor="#F2C14E"
+            android:textSize="16sp" />
+
+        <GridLayout
+            android:id="@+id/glKoma"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:columnCount="4" />
+    </LinearLayout>
+</ScrollView>
+package com.example.orientalorg
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import android.view.KeyEvent
+import android.view.ViewGroup
+import android.widget.Button
+import android.widget.GridLayout
+import android.widget.SeekBar
+import android.widget.TextView
+import android.widget.Toast
+import android.widget.ToggleButton
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+
+@SuppressLint("MissingPermission")
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var midi: OrgMidiManager
+    private lateinit var tvStatus: TextView
+    private val koma = KomaManager()
+
+    private val btPerms: Array<String> =
+        if (Build.VERSION.SDK_INT >= 31)
+            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+        else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+
+    private val permLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { res ->
+            if (res.values.all { it }) scanBluetooth()
+            else Toast.makeText(this, "Bluetooth izni gerekli", Toast.LENGTH_SHORT).show()
+        }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        tvStatus = findViewById(R.id.tvMidiStatus)
+        midi = OrgMidiManager(this) { tvStatus.text = it }
+
+        buildKomaButtons()
+
+        val sb = findViewById<SeekBar>(R.id.sbMaster)
+        NativeAudio.nativeSetMasterVolume(sb.progress / 100f)
+        sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                NativeAudio.nativeSetMasterVolume(p / 100f)
+            }
+            override fun onStartTrackingTouch(s: SeekBar) {}
+            override fun onStopTrackingTouch(s: SeekBar) {}
+        })
+
+        findViewById<Button>(R.id.btnBluetooth).setOnClickListener {
+            val ok = btPerms.all {
+                ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+            }
+            if (ok) scanBluetooth() else permLauncher.launch(btPerms)
+        }
+    }
+
+    private fun buildKomaButtons() {
+        val grid = findViewById<GridLayout>(R.id.glKoma)
+        val h = (72 * resources.displayMetrics.density).toInt()
+        val m = (4 * resources.displayMetrics.density).toInt()
+        koma.resetAll()
+        for (pc in 0 until 12) {
+            val name = koma.noteNames[pc]
+            val b = ToggleButton(this).apply {
+                textOn = "$name\n−50¢"
+                textOff = name
+                text = name
+                isChecked = false
+                layoutParams = GridLayout.LayoutParams(
+                    GridLayout.spec(GridLayout.UNDEFINED, 1f),
+                    GridLayout.spec(GridLayout.UNDEFINED, 1f)
+                ).apply {
+                    width = 0
+                    height = h
+                    setMargins(m, m, m, m)
+                }
+                setOnCheckedChangeListener { _, checked -> koma.set(pc, checked) }
+            }
+            grid.addView(b)
+        }
+    }
+
+    private fun scanBluetooth() {
+        tvStatus.text = "Bluetooth MIDI taranıyor (6 sn)…"
+        midi.scanBluetooth { list ->
+            if (list.isEmpty()) {
+                tvStatus.text = "Bluetooth MIDI cihazı bulunamadı"
+                return@scanBluetooth
+            }
+            val names = list.map { d -> runCatching { d.name }.getOrNull() ?: d.address }
+            AlertDialog.Builder(this)
+                .setTitle("Bluetooth MIDI Cihazı")
+                .setItems(names.toTypedArray()) { _, i -> midi.connectBluetooth(list[i]) }
+                .show()
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        if (!NativeAudio.nativeStart())
+            Toast.makeText(this, "Ses motoru başlatılamadı", Toast.LENGTH_LONG).show()
+        midi.start()
+    }
+
+    override fun onStop() {
+        midi.stop()
+        NativeAudio.nativeStop()
+        super.onStop()
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (midi.handleKeyEvent(event)) return true
+        return super.dispatchKeyEvent(event)
+    }
+}
+<uses-feature android:name="android.software.midi" android:required="true" />
+<uses-feature android:name="android.hardware.usb.host" android:required="false" />
+<uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
+<uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+<uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+<uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+    android:usesPermissionFlags="neverForLocation" />
+<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+<application
+    android:label="Oryantal Org"
+    android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+    <activity
+        android:name=".MainActivity"
+        android:exported="true"
+        android:configChanges="orientation|screenSize|keyboard|keyboardHidden|screenLayout|smallestScreenSize|uiMode">
+        <intent-filter>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent-filter>
+    </activity>
+</application>
